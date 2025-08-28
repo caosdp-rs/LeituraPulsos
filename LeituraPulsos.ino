@@ -17,7 +17,7 @@
  * - Qualquer sinal digital 3.3V ou 5V
  * 
  * CONECTIVIDADE:
- * - Pino de entrada: GPIO 4 (configurável)
+ * - Pino de entrada: GPIO 2 (configurável)
  * - Pull-up interno ativado
  * - Comunicação serial: 115200 baud
  * 
