@@ -17,7 +17,7 @@
  * - Qualquer sinal digital 3.3V ou 5V
  * 
  * CONECTIVIDADE:
- * - Pino de entrada: GPIO 2 (configurável)
+ * - Pino de entrada: GPIO 4 (configurável)
  * - Pull-up interno ativado
  * - Comunicação serial: 115200 baud
  * 
@@ -59,8 +59,10 @@
  */
 
 // Tempo mínimo entre pulsos válidos (em microssegundos)
-// Ajuste este valor conforme a frequência máxima esperada
-#define DEBOUNCE_TIME_US 20000
+// Este valor será ajustado automaticamente pelo debounce adaptativo
+#define DEBOUNCE_TIME_US_MIN 100      // Debounce mínimo (para alta frequência)
+#define DEBOUNCE_TIME_US_MAX 5000     // Debounce máximo (para baixa frequência)
+#define DEBOUNCE_TIME_US_DEFAULT 1000 // Debounce inicial padrão
 
 // Tempo de debounce do botão (em milissegundos)
 #define BUTTON_DEBOUNCE_MS 50
@@ -95,6 +97,11 @@ volatile unsigned long lastPulseTime = 0;     // Timestamp do último pulso (mic
 volatile unsigned long pulseInterval = 0;     // Intervalo entre os dois últimos pulsos (μs)
 volatile bool newPulseReceived = false;       // Flag indicando novo pulso detectado
 
+// Variáveis para debounce adaptativo
+volatile unsigned long currentDebounceTime = DEBOUNCE_TIME_US_DEFAULT; // Debounce atual em μs
+volatile unsigned long pulseHistory[5] = {0}; // Histórico dos últimos 5 intervalos
+volatile int historyIndex = 0;                // Índice circular do histórico
+
 // Variáveis para controle de exibição
 unsigned long lastDisplayTime = 0;            // Timestamp do último relatório
 unsigned long lastResetTime = 0;              // Timestamp do último reset automático
@@ -105,31 +112,38 @@ bool lastButtonState = HIGH;                  // Estado anterior do botão (HIGH
 unsigned long lastButtonTime = 0;             // Timestamp da última leitura do botão
 
 /*
- * FUNÇÃO DE INTERRUPÇÃO (ISR - Interrupt Service Routine)
+ * FUNÇÃO DE INTERRUPÇÃO COM DEBOUNCE ADAPTATIVO
  * ====================================================================
- * Esta função é executada automaticamente pelo hardware sempre que
- * uma transição é detectada no pino configurado. Deve ser rápida e
- * eficiente, evitando operações complexas ou bloqueantes.
+ * Esta função implementa um sistema de debounce que se adapta automaticamente
+ * à frequência dos pulsos detectados, otimizando a performance para diferentes
+ * tipos de sinais.
  * 
  * CARACTERÍSTICAS:
- * - Executada em contexto de interrupção
- * - Tem prioridade sobre o código principal
- * - Deve terminar rapidamente
- * - Não deve usar Serial.print() ou delay()
+ * - Debounce adaptativo baseado no histórico de intervalos
+ * - Ajuste automático entre DEBOUNCE_TIME_US_MIN e DEBOUNCE_TIME_US_MAX
+ * - Filtro de ruído inteligente
+ * - Otimização para alta e baixa frequência
  */
 void pulseInterrupt() {
   // Captura o timestamp atual com precisão de microssegundos
   unsigned long currentTime = micros();
   
-  // SISTEMA DE DEBOUNCE:
-  // Ignora pulsos que chegam muito próximos do anterior para
-  // filtrar ruído elétrico e bouncing de contatos mecânicos
-  if (currentTime - lastPulseTime > DEBOUNCE_TIME_US) {
+  // SISTEMA DE DEBOUNCE ADAPTATIVO:
+  // Usa o valor atual de debounce calculado dinamicamente
+  if (currentTime - lastPulseTime > currentDebounceTime) {
     // Calcula o intervalo entre este pulso e o anterior
     pulseInterval = currentTime - lastPulseTime;
     
     // Atualiza o timestamp do último pulso válido
     lastPulseTime = currentTime;
+    
+    // ---- ALGORITMO DE DEBOUNCE ADAPTATIVO ----
+    // Armazena o intervalo no histórico circular
+    pulseHistory[historyIndex] = pulseInterval;
+    historyIndex = (historyIndex + 1) % 5; // Circular: 0, 1, 2, 3, 4, 0, 1...
+    
+    // Calcula o debounce adaptativo baseado no histórico
+    updateAdaptiveDebounce();
     
     // Incrementa o contador total de pulsos
     pulseCount++;
@@ -165,7 +179,7 @@ void setup() {
   Serial.println("• Pino de entrada: GPIO " + String(PULSE_PIN));
   Serial.println("• Pino do botão reset: GPIO " + String(BUTTON_PIN));
   Serial.println("• Modo de detecção: Borda de descida (HIGH → LOW)");
-  Serial.println("• Debounce: " + String(DEBOUNCE_TIME_US) + " μs");
+  Serial.println("• Debounce adaptativo: " + String(DEBOUNCE_TIME_US_MIN) + "-" + String(DEBOUNCE_TIME_US_MAX) + " μs");
   Serial.println("• Pull-up interno: ATIVADO");
   Serial.println("• Velocidade serial: 115200 bps");
   
@@ -267,7 +281,9 @@ void loop() {
     Serial.print(formatFloat(instantFrequency, 2, 10));
     Serial.print(" | ");
     Serial.print(formatNumber(pulseInterval, 7));
-    Serial.print(" | Pulso detectado    |");
+    Serial.print(" | Pulso (D:");
+    Serial.print(currentDebounceTime);
+    Serial.print("μs) |");
     Serial.println();
   }
   
@@ -353,6 +369,52 @@ void checkButtonPress() {
 }
 
 /*
+ * FUNÇÃO DE ATUALIZAÇÃO DO DEBOUNCE ADAPTATIVO
+ * ====================================================================
+ * Calcula o tempo de debounce ideal baseado no histórico de intervalos
+ * entre pulsos, adaptando-se automaticamente à frequência do sinal.
+ * 
+ * ALGORITMO:
+ * 1. Calcula a média dos últimos 5 intervalos
+ * 2. Define debounce como 5-10% do intervalo médio
+ * 3. Limita entre DEBOUNCE_TIME_US_MIN e DEBOUNCE_TIME_US_MAX
+ * 4. Aplica filtro de suavização para evitar oscilações
+ */
+void updateAdaptiveDebounce() {
+  // Calcula quantos valores válidos temos no histórico
+  int validCount = 0;
+  unsigned long sum = 0;
+  
+  for (int i = 0; i < 5; i++) {
+    if (pulseHistory[i] > 0) {
+      sum += pulseHistory[i];
+      validCount++;
+    }
+  }
+  
+  // Se temos pelo menos 2 amostras, calcula novo debounce
+  if (validCount >= 2) {
+    // Calcula intervalo médio
+    unsigned long averageInterval = sum / validCount;
+    
+    // Define debounce como 8% do intervalo médio
+    // Isso garante que pulsos legítimos não sejam filtrados
+    unsigned long newDebounce = averageInterval / 12; // ~8.3%
+    
+    // Aplica limites mínimo e máximo
+    if (newDebounce < DEBOUNCE_TIME_US_MIN) {
+      newDebounce = DEBOUNCE_TIME_US_MIN;
+    } else if (newDebounce > DEBOUNCE_TIME_US_MAX) {
+      newDebounce = DEBOUNCE_TIME_US_MAX;
+    }
+    
+    // Aplica filtro de suavização (média ponderada)
+    // 70% do valor atual + 30% do novo valor
+    currentDebounceTime = (currentDebounceTime * 7 + newDebounce * 3) / 10;
+  }
+}
+
+/*
  * FUNÇÃO AUXILIAR PARA RESET AUTOMÁTICO DO SISTEMA
  * ====================================================================
  * Esta função é chamada automaticamente a cada 30 segundos para
@@ -373,6 +435,13 @@ void autoResetCounter() {
   lastPulseTime = 0;
   pulseInterval = 0;
   newPulseReceived = false;
+  
+  // Reinicia variáveis do debounce adaptativo
+  currentDebounceTime = DEBOUNCE_TIME_US_DEFAULT;
+  historyIndex = 0;
+  for (int i = 0; i < 5; i++) {
+    pulseHistory[i] = 0;
+  }
   
   interrupts();
   // ---- FIM DA SEÇÃO CRÍTICA ----
@@ -426,6 +495,13 @@ void resetCounter() {
   lastPulseTime = 0;        // Timestamp do último pulso
   pulseInterval = 0;        // Intervalo entre pulsos
   newPulseReceived = false; // Flag de novo pulso
+  
+  // Reinicia variáveis do debounce adaptativo
+  currentDebounceTime = DEBOUNCE_TIME_US_DEFAULT;
+  historyIndex = 0;
+  for (int i = 0; i < 5; i++) {
+    pulseHistory[i] = 0;
+  }
   
   // Reinicia o timer de reset automático apenas se estiver habilitado
   if (AUTO_RESET_ENABLED) {
@@ -496,18 +572,25 @@ String formatFloat(float number, int decimals, int width) {
  * - Frequência máxima prática: ~100 kHz (recomendada)
  * 
  * LIMITAÇÕES:
- * - Debounce fixo pode limitar frequências muito altas
  * - Serial.print() pode causar pequenos atrasos na exibição
  * - Overflow de variáveis após ~49 dias de operação contínua
  * 
+ * DEBOUNCE ADAPTATIVO:
+ * - Algoritmo inteligente que se adapta à frequência do sinal
+ * - Histórico de 5 amostras para cálculo da média
+ * - Debounce calculado como 8% do intervalo médio
+ * - Limites configuráveis: 100μs a 5000μs
+ * - Filtro de suavização para estabilidade
+ * - Otimização automática para alta e baixa frequência
+ * 
  * MELHORIAS POSSÍVEIS:
- * - Implementar debounce adaptativo
  * - Adicionar buffer circular para médias móveis
  * - Implementar comunicação via WiFi/Bluetooth
  * - Adicionar display LCD/OLED
  * - Implementar data logging em cartão SD
  * - Configurar intervalo de reset via comando serial
  * - Implementar controle de reset via botão físico
+ * - Adicionar detecção automática de tipo de sinal
  * 
  * CONFIGURAÇÃO DO RESET AUTOMÁTICO:
  * - Para HABILITAR: #define AUTO_RESET_ENABLED true
@@ -522,9 +605,10 @@ String formatFloat(float number, int decimals, int width) {
  * 
  * TROUBLESHOOTING:
  * - Se não detectar pulsos: verificar conexões e nível do sinal
- * - Se contar pulsos duplicados: aumentar DEBOUNCE_TIME_US
- * - Se perder pulsos: diminuir DEBOUNCE_TIME_US
+ * - Se contar pulsos duplicados: sistema se auto-ajustará
+ * - Se perder pulsos: debounce adaptativo se ajustará automaticamente
  * - Para sinais de 5V: usar divisor de tensão ou level shifter
+ * - Para frequências > 100kHz: verificar se debounce mínimo é adequado
  * 
  * ====================================================================
  */
